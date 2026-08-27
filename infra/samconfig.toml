@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "earthquake-stream-monitor"
+resolve_s3 = true
+s3_prefix = "earthquake-stream-monitor"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "RetentionDays=\"180\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

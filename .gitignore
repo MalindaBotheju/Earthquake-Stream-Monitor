@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# SAM build output
+.aws-sam/
+
+# Local secrets
+.env
+.streamlit/secrets.toml
+*.csv
+*_accessKeys*
+
+# Lambda invoke test output
+response.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

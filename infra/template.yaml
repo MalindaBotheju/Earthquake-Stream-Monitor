@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Global Earthquake Stream Monitor -- serverless, event-driven pipeline.
+  EventBridge (hourly) -> ingest Lambda -> SQS -> process Lambda -> DynamoDB
+  -> API Gateway -> Streamlit dashboard (external, deployed separately).
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Architectures: [x86_64]
+
+Parameters:
+  RetentionDays:
+    Type: Number
+    Default: 180              # ~6 months, matches shared/utils.py RETENTION_SECONDS
+
+Resources:
+
+  ## ---------------------------------------------------------------------
+  ## Queue: buffers new/updated quakes between ingest and processing.
+  ## A dead-letter queue catches anything process_lambda fails on 3x in a
+  ## row, so one bad message can't get stuck retrying forever or block
+  ## the rest of the queue.
+  ## ---------------------------------------------------------------------
+  EarthquakeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600   # 14 days
+
+  EarthquakeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EarthquakeDLQ.Arn
+        maxReceiveCount: 3
+
+  ## ---------------------------------------------------------------------
+  ## Tables
+  ## Billing mode is on-demand (PAY_PER_REQUEST): at this project's volume
+  ## (roughly a few dozen writes/hour, occasional dashboard reads) the
+  ## actual cost is a small fraction of a cent per month -- effectively
+  ## free in practice, even though DynamoDB's named "always free" tier
+  ## technically applies to provisioned-capacity mode. A CloudWatch
+  ## billing alarm (set up once, outside this template) is the safety net.
+  ## ---------------------------------------------------------------------
+
+  EarthquakesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: earthquakes
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: feed
+          AttributeType: S
+        - AttributeName: region
+          AttributeType: S
+        - AttributeName: time
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      GlobalSecondaryIndexes:
+        # Lets the API ask "give me the most recent N quakes globally"
+        # without a full table scan. `feed` is always the constant string
+        # "global" -- a deliberate hot-partition-by-design tradeoff that's
+        # fine at this write volume.
+        - IndexName: recent-index
+          KeySchema:
+            - AttributeName: feed
+              KeyType: HASH
+            - AttributeName: time
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        # Lets the API and process_lambda ask "give me recent quakes in
+        # this region" without a scan.
+        - IndexName: region-index
+          KeySchema:
+            - AttributeName: region
+              KeyType: HASH
+            - AttributeName: time
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  RegionRollupsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: region_rollups
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: region
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: region
+          KeyType: HASH
+        - AttributeName: date
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  SequencesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: sequences
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sequence_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sequence_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: alerts
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: region
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: region
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  ## ---------------------------------------------------------------------
+  ## Lambda 1: ingest -- woken hourly, talks to USGS, pushes to SQS.
+  ## ---------------------------------------------------------------------
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: earthquake-ingest
+      CodeUri: ../ingest_lambda/
+      Handler: handler.lambda_handler
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref EarthquakeQueue
+          EARTHQUAKES_TABLE: !Ref EarthquakesTable
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt EarthquakeQueue.QueueName
+        - DynamoDBReadPolicy:
+            TableName: !Ref EarthquakesTable
+      Events:
+        HourlySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 hour)
+            Description: Wake up once an hour and check USGS for new/updated quakes
+
+  ## ---------------------------------------------------------------------
+  ## Lambda 2: process -- triggered by SQS, does the actual data work.
+  ## ---------------------------------------------------------------------
+  ProcessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: earthquake-process
+      CodeUri: ../process_lambda/
+      Handler: handler.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          EARTHQUAKES_TABLE: !Ref EarthquakesTable
+          ROLLUPS_TABLE: !Ref RegionRollupsTable
+          SEQUENCES_TABLE: !Ref SequencesTable
+          ALERTS_TABLE: !Ref AlertsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EarthquakesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RegionRollupsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SequencesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AlertsTable
+      Events:
+        QueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EarthquakeQueue.Arn
+            BatchSize: 10
+
+  ## ---------------------------------------------------------------------
+  ## Lambda 3: read-only API for the dashboard.
+  ## ---------------------------------------------------------------------
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: earthquake-api
+      CodeUri: ../api_lambda/
+      Handler: handler.lambda_handler
+      Environment:
+        Variables:
+          EARTHQUAKES_TABLE: !Ref EarthquakesTable
+          ROLLUPS_TABLE: !Ref RegionRollupsTable
+          SEQUENCES_TABLE: !Ref SequencesTable
+          ALERTS_TABLE: !Ref AlertsTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EarthquakesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref RegionRollupsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref SequencesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref AlertsTable
+      Events:
+        Recent:
+          Type: Api
+          Properties: { Path: /recent, Method: get }
+        Clusters:
+          Type: Api
+          Properties: { Path: /clusters, Method: get }
+        Alerts:
+          Type: Api
+          Properties: { Path: /alerts, Method: get }
+        HistoryTrend:
+          Type: Api
+          Properties: { Path: /history/trend, Method: get }
+        HistoryHeatmap:
+          Type: Api
+          Properties: { Path: /history/heatmap, Method: get }
+        HistoryTop:
+          Type: Api
+          Properties: { Path: /history/top-quakes, Method: get }
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for the dashboard's API_BASE_URL secret
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  QueueUrl:
+    Value: !Ref EarthquakeQueue
+  EarthquakesTableName:
+    Value: !Ref EarthquakesTable

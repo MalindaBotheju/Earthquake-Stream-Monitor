@@ -1,0 +1,16 @@
+version = 0.1
+
+[default.build.parameters]
+template_file = "infra/template.yaml"
+
+[default.deploy.parameters]
+template_file = "infra/template.yaml"
+stack_name = "earthquake-stream-monitor"
+s3_prefix = "earthquake-stream-monitor"
+region = "us-east-1"           # change to whichever region you deploy in
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+resolve_s3 = true
+
+# Running `sam deploy --guided` the first time will offer to write/update
+# this file for you -- these are just sane starting defaults.

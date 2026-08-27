@@ -1,0 +1,2 @@
+# boto3 is already available in the AWS Lambda Python runtime -- no
+# third-party dependencies needed for this function (stdlib urllib only).
